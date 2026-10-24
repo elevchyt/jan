@@ -1,8 +1,6 @@
 /**
- * @file This file exports a class that implements the InferenceExtension interface from the @janhq/core package.
- * The class provides methods for initializing and stopping a model, and for making inference requests.
- * It also subscribes to events emitted by the @janhq/core package and handles new message requests.
- * @version 1.0.0
+ * @file The llama.cpp built-in: `activate(ctx)` registers the in-process
+ * engine with the host's engine manager and provides `ServiceKeys.Llamacpp`.
  * @module llamacpp-extension/src/index
  */
 
@@ -25,6 +23,9 @@ import {
  DownloadEvent,
  ServiceKeys,
  type DownloadService,
+ type InternalExtensionContext,
+ type LlamacppService,
+ type ServiceRegistry,
  chatCompletionRequestMessage,
  SettingComponentProps,
  DropdownComponentProps,
@@ -161,12 +162,6 @@ const PRESET_AFFECTING_KEYS = new Set<string>([
  'lazy_mode',
 ])
 
-
-/**
- * A class that implements the InferenceExtension interface from the @janhq/core package.
- * The class provides methods for initializing and stopping a model, and for making inference requests.
- * It also subscribes to events emitted by the @janhq/core package and handles new message requests.
- */
 
 type YamlSettingValue = string | number | boolean | null
 
@@ -430,6 +425,32 @@ async function findLlamaServerDir(
 //  - lib/
 //    - e.g. libcudart.so.12
 
+// The package name: what the settings entries carry as their owner, and the
+// key the settings lived under in webview storage before the file store.
+const PACKAGE_NAME = '@janhq/llamacpp-extension'
+
+/**
+ * Runs the engine on the extension host: registers it with the engine
+ * manager and publishes the runtime queries the app makes of it.
+ */
+export async function activate(ctx: InternalExtensionContext): Promise<void> {
+ const engine = new llamacpp_extension(ctx.internal.services)
+ ctx.subscriptions.add(ctx.internal.engines.register(engine))
+ ctx.subscriptions.add({ dispose: () => engine.dispose() })
+ const service: LlamacppService = {
+  getModelProps: (modelId) => engine.getModelProps(modelId),
+  unload: (modelId) => engine.unload(modelId),
+  getDevices: () => engine.getDevices(),
+  reconcileEngineDevices: () => engine.reconcileEngineDevices(),
+ }
+ ctx.subscriptions.add(ctx.internal.services.provide(ServiceKeys.Llamacpp, service))
+ // As under the old extension manager, a failed startup is logged and the
+ // engine stays registered, so the provider and its models remain listed.
+ await engine.start().catch((error: unknown) =>
+  ctx.log.error('Engine startup failed:', error)
+ )
+}
+
 export default class llamacpp_extension extends AIEngine implements EmbeddingEngine {
  provider: string = 'llamacpp'
  timeout: number = 600
@@ -476,9 +497,11 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
  /** Single-flight provisioning run; see ensureProvisioned(). */
  private provisioning?: Promise<void>
 
- override async onLoad(): Promise<void> {
-  super.onLoad() // Calls registerEngine() from AIEngine
+ constructor(private readonly services: Pick<ServiceRegistry, 'get'>) {
+  super()
+ }
 
+ async start(): Promise<void> {
   await this.migrateLocalStorageToFile()
 
   // The engine is bundled at a pinned version, so there is no backend or
@@ -807,11 +830,11 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
   }
  }
 
- override async registerSettings(
+ private async registerSettings(
   settings: SettingComponentProps[]
  ): Promise<void> {
   settings.forEach((s) => {
-   s.extensionName = this.name
+   s.extensionName = PACKAGE_NAME
   })
   const old = await readSettingsFile()
   if (old.length) {
@@ -842,10 +865,9 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
  // no-localstorage.test.ts via the `localstorage-migration-allowed` markers.
  private async migrateLocalStorageToFile(): Promise<void> {
   if (await settingsFileExists()) return
-  if (!this.name) return
   let raw: string | null = null
   try {
-   raw = localStorage.getItem(this.name) // localstorage-migration-allowed
+   raw = localStorage.getItem(PACKAGE_NAME) // localstorage-migration-allowed
   } catch {
    raw = null
   }
@@ -863,7 +885,7 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
    return
   }
   try {
-   localStorage.removeItem(this.name) // localstorage-migration-allowed
+   localStorage.removeItem(PACKAGE_NAME) // localstorage-migration-allowed
   } catch (e) {
    logger.warn('Failed to clear migrated localStorage entry:', e)
   }
@@ -1341,9 +1363,7 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
   return this.providerPath
  }
 
- override async onUnload(): Promise<void> {
-  // Terminate all active sessions
-
+ dispose(): void {
   // Clean up validation event listeners
   if (this.unlistenValidationStarted) {
    this.unlistenValidationStarted()
@@ -1352,9 +1372,9 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
   // Deliberately does NOT stop the engine worker. It outlives any single
   // extension instance: the app owns its lifetime and stops it on
   // ExitRequested/Exit. An extension teardown is not an app exit -- React
-  // StrictMode and HMR both unload and immediately reload us, and awaiting
-  // backgroundInit here (as this used to) meant blocking until the worker was
-  // up, then killing exactly the process it had just started.
+  // StrictMode and HMR both deactivate and immediately reactivate us, and
+  // awaiting backgroundInit here (as this used to) meant blocking until the
+  // worker was up, then killing exactly the process it had just started.
   this.enginePort = undefined
   this.engineApiKey = undefined
  }
@@ -2437,12 +2457,8 @@ export default class llamacpp_extension extends AIEngine implements EmbeddingEng
   }
  }
 
- // The download built-in runs on the extension host now; this legacy
- // class reaches it through the window global until it migrates (P4).
  private downloads(): DownloadService {
-  const service = window.core?.extensionHost?.services.get(
-   ServiceKeys.Downloads
-  )
+  const service = this.services.get(ServiceKeys.Downloads)
   if (!service) throw new Error('Downloads service is not available')
   return service
  }
